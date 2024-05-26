@@ -43,7 +43,7 @@ class UpsampleLayer(nn.Module):
 
 
 class WMambaLayer(nn.Module):
-    def __init__(self, dim, feature_map_size, d_state = 16, d_conv = 4, expand = 2, channel_token = False, add_wavelet = False):
+    def __init__(self, dim, feature_map_size, d_state = 16, d_conv = 4, expand = 2, input_channel =0, channel_token = False, add_wavelet = False):
         super().__init__()
         self.dim = dim
         self.norm = nn.LayerNorm(dim)
@@ -56,24 +56,26 @@ class WMambaLayer(nn.Module):
         self.channel_token = channel_token ## whether to use channel as tokens
         self.add_wavelet = add_wavelet ## whether to add wavelet
         
-        self.wavelet_layer = WaveletLayer((dim, feature_map_size[0], feature_map_size[1], feature_map_size[2]), pywt.Wavelet("sym4"))
-        self.reconstruction_layer = nn.Sequential(
-                nn.Conv3d(
-                    in_channels = dim,
-                    out_channels= 2*dim,
-                    kernel_size= (3,3,3),
-                    padding = "same",
-                ),
-                nn.LeakyReLU(),
-                nn.Conv3d(
-                    in_channels = 2*dim,
-                    out_channels= dim,
-                    kernel_size= (3,3,3),
-                    padding = "same",
-                ),
-                nn.LeakyReLU(),
-        )
-    
+        # add wavelet -> init wavelet_layer and reconstruction_layer
+        if add_wavelet:
+            self.wavelet_layer = WaveletLayer((input_channel, feature_map_size[0], feature_map_size[1], feature_map_size[2]), pywt.Wavelet("sym4"))
+            self.reconstruction_layer = nn.Sequential(
+                    nn.Conv3d(
+                        in_channels = input_channel,
+                        out_channels= 2*input_channel,
+                        kernel_size= (3,3,3),
+                        padding = "same",
+                    ),
+                    nn.LeakyReLU(),
+                    nn.Conv3d(
+                        in_channels = 2*input_channel,
+                        out_channels= input_channel,
+                        kernel_size= (3,3,3),
+                        padding = "same",
+                    ),
+                    nn.LeakyReLU(),
+            )
+
     def forward_patch_token(self, x):
         B, d_model = x.shape[:2]
         assert d_model == self.dim
@@ -85,22 +87,9 @@ class WMambaLayer(nn.Module):
         out = x_mamba.transpose(-1, -2).reshape(B, d_model, *img_dims)
 
         return out
-
-    def forward_channel_token(self, x):
-        B, n_tokens = x.shape[:2]
-        d_model = x.shape[2:].numel()
-        assert d_model == self.dim, f"d_model: {d_model}, self.dim: {self.dim}"
-        img_dims = x.shape[2:]
-        x_flat = x.flatten(2)
-        assert x_flat.shape[2] == d_model, f"x_flat.shape[2]: {x_flat.shape[2]}, d_model: {d_model}"
-        x_norm = self.norm(x_flat)
-        x_mamba = self.mamba(x_norm)
-        out = x_mamba.reshape(B, n_tokens, *img_dims)
-
-        return out
     
     def forward_patch_wavelet_token(self, x):
-        B, d_model = x.shape[:2]
+        B, d_model = x.shape[:2]  # B, C
         assert d_model == self.dim
         n_tokens = x.shape[2:].numel()
         img_dims = x.shape[2:]
@@ -116,13 +105,31 @@ class WMambaLayer(nn.Module):
 
         return out
 
+    def forward_channel_wavelet_token(self, x):
+        B, n_tokens = x.shape[:2]
+        d_model = x.shape[2:].numel()
+        assert d_model == self.dim, f"d_model: {d_model}, self.dim: {self.dim}"
+        img_dims = x.shape[2:]
+        #####
+        x = self.wavelet_layer(x)
+        x_flat = x.flatten(2)
+        assert x_flat.shape[2] == d_model, f"x_flat.shape[2]: {x_flat.shape[2]}, d_model: {d_model}"
+        x_norm = self.norm(x_flat)
+        x_mamba = self.mamba(x_norm)
+        out = x_mamba.reshape(B, n_tokens, *img_dims)
+        #####
+        out = self.reconstruction_layer(out)
+        out = out + x
+
+        return out
+
     @autocast(enabled=False)
     def forward(self, x):
         if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
             x = x.type(torch.float32)
         
         if self.channel_token:
-            out = self.forward_channel_token(x)
+            out = self.forward_channel_wavelet_token(x)
         elif self.channel_token == False and self.add_wavelet:
             out = self.forward_patch_wavelet_token(x)
         else:
@@ -300,6 +307,7 @@ class ResidualMambaEncoder(nn.Module):
                 WMambaLayer(
                     dim = np.prod(feature_map_sizes[s]) if do_channel_token[s] else features_per_stage[s],
                     channel_token = do_channel_token[s],
+                    input_channel = features_per_stage[s],
                     feature_map_size = feature_map_sizes[s],
                     add_wavelet = add_wavelet,
                 )
